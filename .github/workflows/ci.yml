@@ -12,6 +12,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: npx tsc --noEmit --skipLibCheck --target ES2022 --module ESNext --moduleResolution bundler --allowImportingTsExtensions extensions/context-timeline.ts index.ts
+      - run: npx tsc --noEmit
       - run: npm pack --dry-run
       - run: node --check extensions/context-timeline.ts

@@ -1,6 +1,6 @@
 {
   "name": "pi-context-timeline",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Interactive context timeline for Pi coding agent — visualize how prompts, messages, tools, and compaction build the model context",
   "type": "module",
   "keywords": [
@@ -11,7 +11,7 @@
     "timeline"
   ],
   "license": "MIT",
-  "author": "Danu28",
+  "author": "Danu28 <https://github.com/Danu28>",
   "repository": {
     "type": "git",
     "url": "https://github.com/Danu28/pi-context-timeline.git"

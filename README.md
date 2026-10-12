@@ -26,7 +26,7 @@ Token estimates (~4 chars/token) and a **~128k est. progress bar** in header/sta
 # from git (recommended)
 pi install git:github.com/Danu28/pi-context-timeline
 # pinned
-pi install git:github.com/Danu28/pi-context-timeline@v1.0.3
+pi install git:github.com/Danu28/pi-context-timeline@v1.0.4
 
 # update
 pi update --extensions

@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.4] - 2026-10-12
+### Fixed
+- Wrap all pi.on handlers with try/catch (tool/context/compaction/turn/agent/model)
+- Add tsconfig.json (strict) and CI uses tsc --noEmit
+- Author field with URL
+
+
+
 ## [1.0.3] - 2026-10-12
 ### Fixed
 - Token accounting: tool-call/tool-result now counted in window, truncation subtracts dropped tokens

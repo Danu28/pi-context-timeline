@@ -455,18 +455,23 @@ function wrap(s: string, w: number): string[] {
 
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_ev: SessionStartEvent, ctx) => {
-    currentCtx = ctx as unknown as ExtensionContext;
-    const sid: string | undefined = (ctx as any).sessionId ?? (_ev as any).sessionId;
-    const isNewSession = sid !== lastSessionId;
-    if (sid) lastSessionId = sid;
-    if (timeline.length === 0) {
-      push({ kind: "session", label: "Session started", detail: `Session ${String(sid ?? "").slice(0, 8)} · cwd: ${String(process.cwd()).split(/[\\/]/).pop() ?? process.cwd()}`, meta: (ctx as any).mode ?? "" });
-      push({ kind: "info", label: "How context works", detail: "System prompt (instructions+tools+skills) + conversation + tool results = context. When ~window fills, Pi compacts old turns. Use /ctx to view." });
-    } else if (isNewSession) {
-      push({ kind: "session", label: "Session resumed", detail: `Resumed · ${timeline.length} prior events (session ${String(sid ?? "").slice(0,8)})` });
+    try {
+      currentCtx = ctx as unknown as ExtensionContext;
+      const sid: string | undefined = (ctx as any).sessionId ?? (_ev as any).sessionId;
+      const isNewSession = sid !== lastSessionId;
+      if (sid) lastSessionId = sid;
+      if (timeline.length === 0) {
+        const base = (() => { try { const p = require("node:path"); return p.basename(process.cwd()); } catch { return String(process.cwd()).split(/[\\/]/).pop() ?? process.cwd(); }})();
+        push({ kind: "session", label: "Session started", detail: `Session ${String(sid ?? "").slice(0, 8)} · cwd: ${base}`, meta: (ctx as any).mode ?? "" });
+        push({ kind: "info", label: "How context works", detail: "System prompt (instructions+tools+skills) + conversation + tool results = context. When ~window fills, Pi compacts old turns. Use /ctx to view." });
+      } else if (isNewSession) {
+        push({ kind: "session", label: "Session resumed", detail: `Resumed · ${timeline.length} prior events (session ${String(sid ?? "").slice(0,8)})` });
+      }
+      if ((ctx as any).model) lastModel = `${(ctx as any).model.provider}/${(ctx as any).model.id}`;
+      updateWidget();
+    } catch (e: any) {
+      push({ kind: "info", label: "session_start error", detail: String(e?.message ?? e).slice(0, 400), meta: "error" });
     }
-    if ((ctx as any).model) lastModel = `${(ctx as any).model.provider}/${(ctx as any).model.id}`;
-    updateWidget();
   });
 
   pi.on("session_shutdown", async () => {
@@ -476,10 +481,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("model_select", async (ev: any, _ctx) => {
-    lastModel = `${ev.model.provider}/${ev.model.id}`;
-    const prev = ev.previousModel ? `${ev.previousModel.provider}/${ev.previousModel.id}` : "none";
-    push({ kind: "model", label: `Model → ${lastModel}`, detail: `${prev} → ${lastModel} · source: ${ev.source ?? "unknown"}`, meta: ev.source });
-    updateWidget();
+    try {
+      lastModel = `${ev.model.provider}/${ev.model.id}`;
+      const prev = ev.previousModel ? `${ev.previousModel.provider}/${ev.previousModel.id}` : "none";
+      push({ kind: "model", label: `Model → ${lastModel}`, detail: `${prev} → ${lastModel} · source: ${ev.source ?? "unknown"}`, meta: ev.source });
+      updateWidget();
+    } catch (e: any) { push({ kind: "info", label: "model_select error", detail: String(e?.message ?? e).slice(0,400), meta: "error" }); }
   });
 
   pi.on("before_agent_start", async (ev: BeforeAgentStartEvent, _ctx) => {
@@ -512,12 +519,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("context", async (ev: ContextEvent) => {
-    const before = (ev as any).messages?.length ?? (ev as any).context?.length ?? 0;
-    push({ kind: "context", label: `Context transform · ${before} msgs`, detail: `A context handler ran. This is where extensions can trim/reorder/inject messages before the model sees them. If no handler returned a value, context is unchanged.`, meta: `in: ${before}` });
+    try {
+      const before = (ev as any).messages?.length ?? (ev as any).context?.length ?? 0;
+      push({ kind: "context", label: `Context transform · ${before} msgs`, detail: `A context handler ran. This is where extensions can trim/reorder/inject messages before the model sees them. If no handler returned a value, context is unchanged.`, meta: `in: ${before}` });
+    } catch (e: any) { push({ kind: "info", label: "context error", detail: String(e?.message ?? e).slice(0,400), meta: "error" }); }
   });
 
   pi.on("message_start", async (_ev: any) => {
-    push({ kind: "info", label: "Assistant streaming…", detail: `Model ${lastModel ?? ""} started generating`, meta: "stream" });
+    try { push({ kind: "info", label: "Assistant streaming…", detail: `Model ${lastModel ?? ""} started generating`, meta: "stream" }); } catch (e: any) { push({ kind: "info", label: "message_start error", detail: String(e?.message ?? e).slice(0,400), meta: "error" }); }
   });
 
   pi.on("message_end", async (ev: any) => {
@@ -543,56 +552,56 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (ev: ToolCallEvent) => {
-    const name = (ev as any).toolName ?? (ev as any).name ?? "tool";
-    const input = (ev as any).input ?? (ev as any).args ?? {};
-    const preview = JSON.stringify(input).slice(0, 300);
-    push({ kind: "tool-call", label: `tool: ${name}`, detail: preview || "(no args)", tokensEst: estTokens(preview) || undefined, meta: name });
+    try {
+      const name = (ev as any).toolName ?? (ev as any).name ?? "tool";
+      const input = (ev as any).input ?? (ev as any).args ?? {};
+      const preview = JSON.stringify(input).slice(0, 300);
+      push({ kind: "tool-call", label: `tool: ${name}`, detail: preview || "(no args)", tokensEst: estTokens(preview) || undefined, meta: name });
+    } catch (e: any) { push({ kind: "info", label: "tool_call error", detail: String(e?.message ?? e).slice(0,400), meta: "error" }); }
   });
 
   pi.on("tool_result", async (ev: ToolResultEvent) => {
-    const name = (ev as any).toolName ?? (ev as any).name ?? "tool";
-    const res: any = (ev as any).result ?? ev;
-    const text = res?.content?.[0]?.text ?? res?.text ?? JSON.stringify(res).slice(0, 600);
-    const isErr = res?.isError || (ev as any).isError;
-    push({ kind: "tool-result", label: `${isErr ? "✗" : "✓"} ${name} result`, detail: String(text).slice(0, 2000), tokensEst: estTokens(String(text)) || undefined, meta: isErr ? "error" : "ok" });
+    try {
+      const name = (ev as any).toolName ?? (ev as any).name ?? "tool";
+      const res: any = (ev as any).result ?? ev;
+      const text = res?.content?.[0]?.text ?? res?.text ?? JSON.stringify(res).slice(0, 600);
+      const isErr = res?.isError || (ev as any).isError;
+      push({ kind: "tool-result", label: `${isErr ? "✗" : "✓"} ${name} result`, detail: String(text).slice(0, 2000), tokensEst: estTokens(String(text)) || undefined, meta: isErr ? "error" : "ok" });
+    } catch (e: any) { push({ kind: "info", label: "tool_result error", detail: String(e?.message ?? e).slice(0,400), meta: "error" }); }
   });
 
   pi.on("tool_execution_start" as any, async (ev: any) => {
-    push({ kind: "info", label: `tool exec start: ${ev.toolName ?? ev.name ?? "tool"}`, detail: JSON.stringify(ev.input ?? ev.args ?? {}).slice(0, 400), meta: "exec" });
+    try { push({ kind: "info", label: `tool exec start: ${ev.toolName ?? ev.name ?? "tool"}`, detail: JSON.stringify(ev.input ?? ev.args ?? {}).slice(0, 400), meta: "exec" }); } catch (e: any) { push({ kind: "info", label: "tool_execution_start error", detail: String(e?.message ?? e).slice(0,400), meta: "error" }); }
   });
   pi.on("tool_execution_end" as any, async (ev: any) => {
-    const ok = !ev.error;
-    push({ kind: "info", label: `tool exec end: ${ev.toolName ?? ev.name ?? "tool"} ${ok?"✓":"✗"}`, detail: ev.error ? String(ev.error).slice(0, 800) : `duration ${ev.durationMs ?? "?"}ms`, meta: ok ? "done" : "error" });
+    try { const ok = !ev.error; push({ kind: "info", label: `tool exec end: ${ev.toolName ?? ev.name ?? "tool"} ${ok?"✓":"✗"}`, detail: ev.error ? String(ev.error).slice(0, 800) : `duration ${ev.durationMs ?? "?"}ms`, meta: ok ? "done" : "error" }); } catch (e: any) { push({ kind: "info", label: "tool_execution_end error", detail: String(e?.message ?? e).slice(0,400), meta: "error" }); }
   });
 
   pi.on("turn_end", async (_ev: any) => {
-    const t: any = _ev;
-    push({ kind: "turn", label: "Turn end", detail: t.reason ? `reason: ${t.reason}` : "Agent turn completed — context now includes all new messages + tool results", meta: t.reason ?? "" });
+    try { const t: any = _ev; push({ kind: "turn", label: "Turn end", detail: t.reason ? `reason: ${t.reason}` : "Agent turn completed — context now includes all new messages + tool results", meta: t.reason ?? "" }); } catch (e: any) { push({ kind: "info", label: "turn_end error", detail: String(e?.message ?? e).slice(0,400), meta: "error" }); }
   });
 
   pi.on("agent_end", async (_ev: any) => {
-    const u = (_ev as any).usage ?? (_ev as any).result?.usage;
-    if (u) push({ kind: "info", label: `Agent run end`, detail: `usage: ${u.input ?? "?"} in / ${u.output ?? "?"} out`, tokensEst: (u.input ?? 0) + (u.output ?? 0) || undefined, meta: "agent_end" });
-    else push({ kind: "info", label: "Agent run end", detail: "Run finished; may continue with compaction or follow-ups", meta: "agent_end" });
-    updateWidget();
+    try {
+      const u = (_ev as any).usage ?? (_ev as any).result?.usage;
+      if (u) push({ kind: "info", label: `Agent run end`, detail: `usage: ${u.input ?? "?"} in / ${u.output ?? "?"} out`, tokensEst: (u.input ?? 0) + (u.output ?? 0) || undefined, meta: "agent_end" });
+      else push({ kind: "info", label: "Agent run end", detail: "Run finished; may continue with compaction or follow-ups", meta: "agent_end" });
+      updateWidget();
+    } catch (e: any) { push({ kind: "info", label: "agent_end error", detail: String(e?.message ?? e).slice(0,400), meta: "error" }); }
   });
 
   pi.on("agent_settled", async () => {
-    push({ kind: "info", label: "Agent settled — waiting for user", detail: "No more automatic continuations; context is stable until next user message", meta: "settled" });
-    updateWidget();
+    try { push({ kind: "info", label: "Agent settled — waiting for user", detail: "No more automatic continuations; context is stable until next user message", meta: "settled" }); updateWidget(); } catch (e: any) { push({ kind: "info", label: "agent_settled error", detail: String(e?.message ?? e).slice(0,400), meta: "error" }); }
   });
 
   pi.on("session_before_compact" as any, async (ev: any) => {
-    const prep = ev.preparation ?? ev;
-    push({ kind: "compaction", label: `Compaction triggered · ${prep.tokensBefore?.toLocaleString?.() ?? "?"} tokens`, detail: `messagesToSummarize: ${prep.messagesToSummarize?.length ?? "?"}, turnPrefix: ${prep.turnPrefixMessages?.length ?? "?"}, firstKept: ${String(prep.firstKeptEntryId ?? "").slice(0,8)}`, tokensEst: prep.tokensBefore, meta: "before_compact" });
+    try { const prep = ev.preparation ?? ev; push({ kind: "compaction", label: `Compaction triggered · ${prep.tokensBefore?.toLocaleString?.() ?? "?"} tokens`, detail: `messagesToSummarize: ${prep.messagesToSummarize?.length ?? "?"}, turnPrefix: ${prep.turnPrefixMessages?.length ?? "?"}, firstKept: ${String(prep.firstKeptEntryId ?? "").slice(0,8)}`, tokensEst: prep.tokensBefore, meta: "before_compact" }); } catch (e: any) { push({ kind: "info", label: "session_before_compact error", detail: String(e?.message ?? e).slice(0,400), meta: "error" }); }
   });
   pi.on("session_compact" as any, async (ev: SessionCompactEvent) => {
-    const e: any = ev;
-    push({ kind: "compaction", label: `Compacted → summary ${String(e.compactionId ?? "").slice(0,8)}`, detail: (e.summary ?? e.compaction?.summary ?? "").slice(0, 1200) || "Summary created; old turns replaced", tokensEst: e.tokensBefore ?? e.compaction?.tokensBefore, meta: "compact" });
-    updateWidget();
+    try { const e: any = ev; push({ kind: "compaction", label: `Compacted → summary ${String(e.compactionId ?? "").slice(0,8)}`, detail: (e.summary ?? e.compaction?.summary ?? "").slice(0, 1200) || "Summary created; old turns replaced", tokensEst: e.tokensBefore ?? e.compaction?.tokensBefore, meta: "compact" }); updateWidget(); } catch (e: any) { push({ kind: "info", label: "session_compact error", detail: String(e?.message ?? e).slice(0,400), meta: "error" }); }
   });
   pi.on("session_compact_failed" as any, async (ev: any) => {
-    push({ kind: "info", label: "Compaction failed", detail: String(ev.error ?? ev.reason ?? "unknown").slice(0, 800), meta: "error" });
+    try { push({ kind: "info", label: "Compaction failed", detail: String(ev.error ?? ev.reason ?? "unknown").slice(0, 800), meta: "error" }); } catch (e: any) { push({ kind: "info", label: "session_compact_failed error", detail: String(e?.message ?? e).slice(0,400), meta: "error" }); }
   });
 
   async function openTimeline(ctx: ExtensionContext) {
