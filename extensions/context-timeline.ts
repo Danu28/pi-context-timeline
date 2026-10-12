@@ -170,13 +170,6 @@ function sanitizeExportName(input: string, fallback: string): string {
   return safe.endsWith(".json") ? safe : `${safe}.json`;
 }
 
-function safeJoinCwd(name: string): string {
-  // name is already sanitized basename, so join is safe
-  // still verify resolved stays inside cwd
-  // dynamic import to avoid top-level side effects
-  return name; // resolved by caller with path.join, basename guarantees safety
-}
-
 // ── Timeline UI Component ────────────────────────────────────────────────────
 
 function makeTimelineComponent(done: (v: unknown) => void, theme: any, tui: any) {
@@ -256,6 +249,8 @@ function makeTimelineComponent(done: (v: unknown) => void, theme: any, tui: any)
   const comp: any = {
     handleInput(data: string) {
       const v = visible();
+      // Esc clears filter first when filtered, otherwise closes
+      if (data === "\x1b" && filter) { filter = null; tui.requestRender(); return; }
       if (data === "\x1b" || data === "q" || data === "\x03") { done(null); return; }
       if (data === "?" ) { showHelp = !showHelp; tui.requestRender(); return; }
       if (data === "c" || data === "C") {
@@ -292,8 +287,7 @@ function makeTimelineComponent(done: (v: unknown) => void, theme: any, tui: any)
         selected = 0; scroll = 0;
         tui.requestRender(); return;
       }
-      // Esc when filtered clears filter first
-      if (data === "\x1b" && filter) { filter = null; tui.requestRender(); return; }
+      // (Esc+filter handled above)
       if (data === "\r" || data === "\n" || data === " " ) {
         const cur = v[selected];
         if (cur) {
@@ -468,9 +462,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
-    currentCtx = null;
     if (widgetTimer) { clearTimeout(widgetTimer); widgetTimer = null; }
     try { (currentCtx as any)?.ui?.setStatus?.("context-timeline", ""); } catch {}
+    currentCtx = null;
   });
 
   pi.on("model_select", async (ev: any, _ctx) => {
