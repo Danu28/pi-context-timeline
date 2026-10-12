@@ -2,8 +2,6 @@
 
 Interactive **context timeline** extension for the [Pi coding agent](https://pi.dev) — helps you *see* how Pi builds the model context.
 
-![timeline idea: system prompt → messages → tools → compaction → token window]
-
 ## What it shows
 
 Every model call sends **context** = *system prompt + conversation + tool results*.
@@ -14,19 +12,21 @@ This extension logs each piece as a live timeline so you understand what the mod
 | ⬢ system | `before_agent_start` — systemPromptOptions (sections, tools, guidelines, skills) |
 | ▶ user | user messages appended to history |
 | ◆ assistant | assistant generations (with token usage) |
-| 🔧 tool-call / ↳ result | tool invocations and their outputs (become context) |
+| ◈ tool-call / ↳ result | tool invocations and their outputs (become context) |
 | ⇄ context | extension transforms that edit context before the model sees it |
 | ✂ compaction | when the window fills, old turns are summarized |
-| 🤖 model | model switches |
+| ⬣ model | model switches |
 | ─ turn / settled | turn boundaries |
 
-Token estimates (~4 chars/token) and a **128k progress bar** in header/status show window pressure.
+Token estimates (~4 chars/token) and a **~128k est. progress bar** in header/status show window pressure (real limits vary 128k–200k by model).
 
 ## Install
 
 ```bash
 # from git (recommended)
 pi install git:github.com/Danu28/pi-context-timeline
+# pinned
+pi install git:github.com/Danu28/pi-context-timeline@v1.0.1
 
 # update
 pi update --extensions
@@ -38,17 +38,8 @@ pi remove git:github.com/Danu28/pi-context-timeline
 Or try without installing:
 
 ```bash
-pi --extension ./context-timeline
-# or from package path
+pi --extension ./extensions/context-timeline.ts
 pi -e git:github.com/Danu28/pi-context-timeline
-```
-
-Manual (legacy):
-
-```bash
-mkdir -p ~/.pi/agent/extensions
-cp -r ./pi-context-timeline ~/.pi/agent/extensions/context-timeline
-# restart pi
 ```
 
 No dependencies — pure TypeScript via `jiti`.
@@ -59,7 +50,7 @@ No dependencies — pure TypeScript via `jiti`.
 |---------|-------|------|
 | `/context-timeline` | `/ctx`, `/ctx-timeline` | open interactive timeline overlay |
 | `/ctx-clear` | | clear timeline |
-| `/ctx-export [file]` | | export JSON (`./context-timeline-<ts>.json`) |
+| `/ctx-export [file]` | | export JSON (`./context-timeline-<ts>.json` — basename sanitized) |
 | `/context-timeline-help` | | explain how Pi context works |
 
 ## Timeline UI keys
@@ -68,19 +59,19 @@ No dependencies — pure TypeScript via `jiti`.
 - `Enter` / `Space` — expand detail
 - `g` / `G` — top / bottom
 - `PgUp` / `PgDn` — page
-- `f` — cycle filter (system→user→assistant→tool→context→compaction→all)
+- `f` — cycle filter (system→user→assistant→tool→context→compaction→model→session→turn→info→all)
 - `c` — clear
-- `e` — export
+- `e` — export (async, consistent schema)
 - `?` — toggle help (how context works)
-- `q` / `Esc` — close
+- `q` / `Esc` — close (Esc clears filter first when filtered)
 
 ## Status bar
 
-A compact indicator is kept via `ctx.ui.setStatus("context-timeline", …)`:
+Compact indicator via `ctx.ui.setStatus("context-timeline", …)`:
 
-`◷ 42·💬12·🔧8·███░░░░░░░ 32% (18.2k/6.1k) ✂1`
+`◷ 42 | 💬12 | 🔧8 | ███░░░░░░░ ~32% (18.2k/6.1k) ✂1`
 
-events · messages · tools · token bar · in/out · compactions
+events | messages | tools | ~token bar | in/out | compactions
 
 ## How Pi context works (summary)
 
@@ -94,19 +85,19 @@ events · messages · tools · token bar · in/out · compactions
 ## Files
 
 - `extensions/context-timeline.ts` — canonical extension entry (Pi package discovery)
-- `index.ts` — root entry (also supported, kept for `pi --extension ./context-timeline`)
+- `index.ts` — shim re-export for `pi --extension ./` backwards compat
 - `package.json` — Pi package manifest (`pi.extensions`)
 - `LICENSE` — MIT
 
 ## Dev
 
 ```bash
-npx tsc --noEmit --skipLibCheck --target ES2022 --module ESNext --moduleResolution bundler --allowImportingTsExtensions context-timeline/index.ts
+npx tsc --noEmit --skipLibCheck --target ES2022 --module ESNext --moduleResolution bundler --allowImportingTsExtensions extensions/context-timeline.ts
 ```
 
 Test load:
 ```bash
-pi --extension ./context-timeline -c "/ctx"
+pi --extension ./extensions/context-timeline.ts -c "/ctx"
 ```
 
 ## License

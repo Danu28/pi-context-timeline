@@ -1,6 +1,6 @@
 {
   "name": "pi-context-timeline",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Interactive context timeline for Pi coding agent — visualize how prompts, messages, tools, and compaction build the model context",
   "type": "module",
   "keywords": [
@@ -21,15 +21,13 @@
     "url": "https://github.com/Danu28/pi-context-timeline/issues"
   },
   "files": [
-    "index.ts",
     "extensions/",
     "README.md",
     "LICENSE"
   ],
   "pi": {
     "extensions": [
-      "./extensions/context-timeline.ts",
-      "./index.ts"
+      "./extensions/context-timeline.ts"
     ]
   },
   "peerDependencies": {

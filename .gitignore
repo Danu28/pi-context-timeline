@@ -6,7 +6,9 @@ pnpm-lock.yaml
 
 # Build
 dist/
+*.tsbuildinfo
 *.js.map
+coverage/
 
 # Pi sessions and exports
 context-timeline-*.json
@@ -23,4 +25,7 @@ Thumbs.db
 
 # Logs
 npm-debug.log*
-plan.md
+
+# IDE
+.vscode/
+.idea/

@@ -4,8 +4,9 @@
  * Shows a live timeline of: system prompt construction, user/assistant messages,
  * tool calls, context transforms, compaction/summaries, model switches, and token usage.
  *
- * Install: put this folder in ~/.pi/agent/extensions/  or  pi --extension ./context-timeline
- * Commands: /ctx  /context-timeline  /ctx-timeline  /ctx-clear  /ctx-export
+ * Install: pi install git:github.com/Danu28/pi-context-timeline
+ *   or: pi --extension ./extensions/context-timeline.ts
+ * Commands: /ctx  /context-timeline  /ctx-timeline  /ctx-clear  /ctx-export  /context-timeline-help
  *
  * Hooks: session_start, before_agent_start, context, message_start/end,
  *        tool_call, tool_result, tool_execution_*, turn_end, agent_end,
@@ -50,7 +51,9 @@ interface TimelineEvent {
 
 let timeline: TimelineEvent[] = [];
 const MAX_EVENTS = 600;
+const ESTIMATED_WINDOW = 128_000; // ~est; real model windows vary 128k-200k (annotated as ~)
 let lastModel: string | null = null;
+let lastSessionId: string | null = null;
 let totalTokensIn = 0;
 let totalTokensOut = 0;
 let compactionCount = 0;
@@ -62,7 +65,6 @@ function uid() {
 
 function estTokens(text: string): number {
   if (!text) return 0;
-  // rough: ~4 chars per token
   return Math.ceil(text.length / 4);
 }
 
@@ -82,8 +84,14 @@ function push(ev: Omit<TimelineEvent, "id" | "ts"> & { ts?: number }) {
     meta: ev.meta,
   };
   timeline.push(e);
-  if (timeline.length > MAX_EVENTS) timeline = timeline.slice(-MAX_EVENTS);
-  // ring: keep totals bounded
+  if (timeline.length > MAX_EVENTS) {
+    const dropped = timeline.length - MAX_EVENTS;
+    timeline = timeline.slice(-MAX_EVENTS);
+    // keep totals bounded roughly - we keep est, but note truncation
+    if (dropped > 0 && e.kind !== "info") {
+      // totals stay; bar is ~ anyway
+    }
+  }
   if (e.tokensEst) {
     if (e.kind === "user" || e.kind === "system" || e.kind === "context") totalTokensIn += e.tokensEst;
     if (e.kind === "assistant") totalTokensOut += e.tokensEst;
@@ -106,41 +114,37 @@ function scheduleWidgetUpdate() {
 function updateWidget() {
   if (!currentCtx) return;
   const ctx = currentCtx;
-  // prefer setStatus (lightweight) + try setWidget if available
   const total = timeline.length;
-  const msgCount = timeline.filter(e => e.kind === "user" || e.kind === "assistant").length;
-  const toolCount = timeline.filter(e => e.kind === "tool-call").length;
+  // single-pass counts (was 2× filter before)
+  let msgCount = 0;
+  let toolCount = 0;
+  for (const e of timeline) {
+    if (e.kind === "user" || e.kind === "assistant") msgCount++;
+    if (e.kind === "tool-call") toolCount++;
+  }
   const tokIn = totalTokensIn;
   const tokOut = totalTokensOut;
-  // crude context window estimate: 128k, warn at 80%
-  const win = 128_000;
+  const win = ESTIMATED_WINDOW;
   const used = tokIn + tokOut;
   const pct = Math.min(100, Math.round((used / win) * 100));
   const barLen = 10;
   const filled = Math.round((pct / 100) * barLen);
   const bar = "█".repeat(filled) + "░".repeat(barLen - filled);
-  const status = `◷ ${total}·💬${msgCount}·🔧${toolCount}·${bar} ${pct}% ${tokIn + tokOut > 0 ? `(${fmtK(tokIn)}/${fmtK(tokOut)})` : ""}${compactionCount ? ` ✂${compactionCount}` : ""}`;
+  const status = `◷ ${total} | 💬${msgCount} | 🔧${toolCount} | ${bar} ~${pct}% ${tokIn + tokOut > 0 ? `(${fmtK(tokIn)}/${fmtK(tokOut)})` : ""}${compactionCount ? ` ✂${compactionCount}` : ""}`;
   try {
-    // setStatus is always available; widget adds more detail if supported
     (ctx.ui as any).setStatus?.("context-timeline", status);
-  } catch {}
-  try {
-    const w = (ctx.ui as any).setWidget;
-    if (typeof w === "function") {
-      // some Pi versions expose setWidget(id, factory)
-    }
   } catch {}
 }
 
 function fmtK(n: number): string {
   if (n < 1000) return String(n);
-  return (n / 1000).toFixed(1) + "k";
+  if (n % 1000 === 0) return `${n/1000}k`;
+  return `${(n / 1000).toFixed(1)}k`;
 }
 
 function summarizeSystemPrompt(opts: any): string {
   const parts: string[] = [];
   if (!opts) return "system prompt (no opts)";
-  // opts is BuildSystemPromptOptions / NormalizedBuildSystemPromptOptions
   if (opts.sections) {
     const secs = Array.isArray(opts.sections) ? opts.sections : Object.entries(opts.sections);
     parts.push(`sections: ${secs.length}`);
@@ -156,6 +160,23 @@ function summarizeSystemPrompt(opts: any): string {
   return parts.join("  ");
 }
 
+// sanitize export filename: no traversal, only .json, inside cwd
+function sanitizeExportName(input: string, fallback: string): string {
+  const raw = (input || fallback).trim();
+  // strip directory components - keep only basename
+  const base = raw.split(/[\\/]/).pop() || fallback;
+  // allow only safe chars, force .json
+  const safe = base.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80) || fallback;
+  return safe.endsWith(".json") ? safe : `${safe}.json`;
+}
+
+function safeJoinCwd(name: string): string {
+  // name is already sanitized basename, so join is safe
+  // still verify resolved stays inside cwd
+  // dynamic import to avoid top-level side effects
+  return name; // resolved by caller with path.join, basename guarantees safety
+}
+
 // ── Timeline UI Component ────────────────────────────────────────────────────
 
 function makeTimelineComponent(done: (v: unknown) => void, theme: any, tui: any) {
@@ -165,11 +186,11 @@ function makeTimelineComponent(done: (v: unknown) => void, theme: any, tui: any)
   let showHelp = false;
   let filter: Kind | null = null;
 
-  const kinds: Kind[] = ["system", "user", "assistant", "tool-call", "tool-result", "context", "compaction"];
+  const allKinds: Kind[] = ["system", "user", "assistant", "tool-call", "tool-result", "context", "compaction", "model", "session", "turn", "info"];
 
   function visible(): TimelineEvent[] {
     if (!filter) return timeline;
-    return timeline.filter(e => e.kind === filter || (filter === "tool-call" && e.kind === "tool-result"));
+    return timeline.filter(e => e.kind === filter);
   }
 
   function clamp() {
@@ -179,14 +200,13 @@ function makeTimelineComponent(done: (v: unknown) => void, theme: any, tui: any)
     if (scroll < 0) scroll = 0;
   }
 
-  // color helpers
   const c = {
-    accent: (s: string) => theme.fg("accent", s),
-    dim: (s: string) => theme.fg("dim", s),
-    muted: (s: string) => theme.fg("muted", s),
-    success: (s: string) => theme.fg("success", s),
-    warning: (s: string) => theme.fg("warning", s),
-    error: (s: string) => theme.fg("error", s),
+    accent: (s: string) => { try { return theme.fg("accent", s); } catch { return s; } },
+    dim: (s: string) => { try { return theme.fg("dim", s); } catch { return s; } },
+    muted: (s: string) => { try { return theme.fg("muted", s); } catch { return s; } },
+    success: (s: string) => { try { return theme.fg("success", s); } catch { return s; } },
+    warning: (s: string) => { try { return theme.fg("warning", s); } catch { return s; } },
+    error: (s: string) => { try { return theme.fg("error", s); } catch { return s; } },
     text: (s: string) => s,
   };
 
@@ -196,13 +216,13 @@ function makeTimelineComponent(done: (v: unknown) => void, theme: any, tui: any)
       case "system": return "⬢";
       case "user": return "▶";
       case "assistant": return "◆";
-      case "tool-call": return "🔧";
+      case "tool-call": return "◈";
       case "tool-result": return "↳";
       case "context": return "⇄";
       case "compaction": return "✂";
-      case "model": return "🤖";
+      case "model": return "⬣";
       case "turn": return "─";
-      case "info": return "ℹ";
+      case "info": return "·";
       default: return "·";
     }
   }
@@ -214,8 +234,8 @@ function makeTimelineComponent(done: (v: unknown) => void, theme: any, tui: any)
       case "assistant": return c.text(s);
       case "tool-call": return c.warning(s);
       case "tool-result": return c.dim(s);
-      case "context": return theme.fg("accent", s); // cyan-ish via accent
-      case "compaction": return theme.fg("warning", s);
+      case "context": return c.accent(s);
+      case "compaction": return c.warning(s);
       case "model": return c.muted(s);
       case "session": return c.accent(s);
       case "turn": return c.dim(s);
@@ -224,16 +244,19 @@ function makeTimelineComponent(done: (v: unknown) => void, theme: any, tui: any)
   }
 
   function truncate(s: string, w: number): string {
-    // simple slice; theme helpers would be better but avoid import fragility
-    if (s.length <= w) return s;
-    return s.slice(0, Math.max(0, w - 1)) + "…";
+    if (w <= 0) return "";
+    // use Array.from for unicode-aware slicing
+    const arr = Array.from(s);
+    if (arr.length <= w) return s;
+    return arr.slice(0, Math.max(0, w - 1)).join("") + "…";
   }
+
+  function stripAnsi(s: string): string { return s.replace(/\x1b\[[0-9;]*m/g, ""); }
 
   const comp: any = {
     handleInput(data: string) {
       const v = visible();
-      // handle escape sequences: arrow keys come as \x1b[A etc
-      if (data === "\x1b" || data === "q" || data === "\x03") { done(null); return; } // Esc / q / ctrl-c
+      if (data === "\x1b" || data === "q" || data === "\x03") { done(null); return; }
       if (data === "?" ) { showHelp = !showHelp; tui.requestRender(); return; }
       if (data === "c" || data === "C") {
         timeline = [];
@@ -243,26 +266,34 @@ function makeTimelineComponent(done: (v: unknown) => void, theme: any, tui: any)
         tui.requestRender(); return;
       }
       if (data === "e" || data === "E") {
-        try {
-          const p = `./context-timeline-${Date.now()}.json`;
-          const fs = require("node:fs");
-          fs.writeFileSync(p, JSON.stringify({ exportedAt: new Date().toISOString(), timeline }, null, 2));
-          push({ kind: "info", label: `Exported to ${p}`, detail: `${timeline.length} events` });
-        } catch (e: any) {
-          push({ kind: "info", label: "Export failed", detail: String(e?.message ?? e) });
-        }
-        tui.requestRender(); return;
+        // async export - fire and notify
+        (async () => {
+          try {
+            const fs = await import("node:fs");
+            const path = await import("node:path");
+            const safeName = sanitizeExportName(`context-timeline-${Date.now()}.json`, "context-timeline.json");
+            const p = path.join(process.cwd(), safeName);
+            const payload = { exportedAt: new Date().toISOString(), model: lastModel, totals: { in: totalTokensIn, out: totalTokensOut, compactions: compactionCount }, timeline };
+            await fs.promises.writeFile(p, JSON.stringify(payload, null, 2), "utf8");
+            push({ kind: "info", label: `Exported to ${safeName}`, detail: `${timeline.length} events → ${p}` });
+          } catch (e: any) {
+            push({ kind: "info", label: "Export failed", detail: String(e?.message ?? e) });
+          }
+          tui.requestRender();
+        })();
+        return;
       }
-      // filter cycle: f
       if (data === "f") {
-        if (!filter) filter = "user";
+        if (!filter) filter = allKinds[0]!;
         else {
-          const idx = kinds.indexOf(filter);
-          filter = idx >= kinds.length - 1 ? null : kinds[idx + 1]!;
+          const idx = allKinds.indexOf(filter);
+          filter = idx >= allKinds.length - 1 ? null : allKinds[idx + 1]!;
         }
         selected = 0; scroll = 0;
         tui.requestRender(); return;
       }
+      // Esc when filtered clears filter first
+      if (data === "\x1b" && filter) { filter = null; tui.requestRender(); return; }
       if (data === "\r" || data === "\n" || data === " " ) {
         const cur = v[selected];
         if (cur) {
@@ -272,25 +303,23 @@ function makeTimelineComponent(done: (v: unknown) => void, theme: any, tui: any)
         }
         return;
       }
-      // navigation
-      if (data === "\x1b[A" || data === "k" || data === "K") { // up
+      if (data === "\x1b[A" || data === "k" || data === "K") {
         selected = Math.max(0, selected - 1);
         if (selected < scroll) scroll = selected;
         tui.requestRender(); return;
       }
-      if (data === "\x1b[B" || data === "j" || data === "J") { // down
+      if (data === "\x1b[B" || data === "j" || data === "J") {
         selected = Math.min(v.length - 1, selected + 1);
-        // viewport approx handled in render
         tui.requestRender(); return;
       }
       if (data === "g") { selected = 0; scroll = 0; tui.requestRender(); return; }
       if (data === "G") { selected = v.length - 1; tui.requestRender(); return; }
-      if (data === "\x1b[5~" ) { // page up
+      if (data === "\x1b[5~" ) {
         selected = Math.max(0, selected - 10);
         scroll = Math.max(0, scroll - 10);
         tui.requestRender(); return;
       }
-      if (data === "\x1b[6~" ) { // page down
+      if (data === "\x1b[6~" ) {
         selected = Math.min(v.length - 1, selected + 10);
         tui.requestRender(); return;
       }
@@ -301,34 +330,28 @@ function makeTimelineComponent(done: (v: unknown) => void, theme: any, tui: any)
       clamp();
       const v = visible();
       const lines: string[] = [];
-      const headerH = 4;
-      const footerH = 3;
-      // reserve header+footer when computing viewport, but render will just output all lines (ScrollView handles it)
-      // We simulate scroll window
       const totalTok = totalTokensIn + totalTokensOut;
-      const pct = Math.min(100, Math.round((totalTok / 128000) * 100));
+      const pct = Math.min(100, Math.round((totalTok / ESTIMATED_WINDOW) * 100));
       const barLen = Math.min(24, Math.max(10, width - 60));
       const filled = Math.round((pct / 100) * barLen);
       const bar = "█".repeat(filled) + "░".repeat(barLen - filled);
       const pctColor = pct > 85 ? c.error : pct > 65 ? c.warning : c.dim;
 
       lines.push(c.accent("┌─ Pi Context Timeline ─────────────────────────────────────────────┐"));
-      // summary line
       const summary = ` ${totalTok ? `${fmtK(totalTokensIn)} in / ${fmtK(totalTokensOut)} out` : "no tokens yet"} · ${timeline.length} events${compactionCount ? ` · ${compactionCount} compaction` : ""} · ${lastModel ?? "no model"}`;
-      const barStr = pctColor(` ${bar} ${pct}% `);
-      // pad
+      const barStr = pctColor(` ${bar} ~${pct}% `);
       const avail = Math.max(0, width - 2);
       let sumLine = summary;
-      if (sumLine.length + barStr.replace(/\x1b\[[0-9;]*m/g, "").length + 4 > avail) {
-        // truncate summary if needed
-        sumLine = truncate(sumLine, avail - barStr.replace(/\x1b\[[0-9;]*m/g, "").length - 4);
+      const barPlain = stripAnsi(barStr);
+      if (sumLine.length + barPlain.length + 4 > avail) {
+        sumLine = truncate(sumLine, avail - barPlain.length - 4);
       }
-      lines.push(`│${sumLine}${" ".repeat(Math.max(1, avail - (sumLine.length + barStr.replace(/\x1b\[[0-9;]*m/g,"").length)))} ${barStr}│`);
-      // legend
+      lines.push(`│${sumLine}${" ".repeat(Math.max(1, avail - (sumLine.length + barPlain.length)))}${barStr}│`);
       const legend = filter
-        ? c.warning(` filter: ${filter}  (f to cycle, Esc to clear filter) `)
-        : c.dim(" legend: ⬢system ▶user ◆assistant 🔧tool ⇄context ✂compact  (f=filter ?=help) ");
-      lines.push(`│${truncate(legend.replace(/\x1b\[[0-9;]*m/g,"").length > avail ? truncate(legend, avail-1) : legend, avail).padEnd(avail)}│`);
+        ? c.warning(` filter: ${filter}  (f cycle, Esc clear) `)
+        : c.dim(" legend: ⬢system ▶user ◆assistant ◈tool ⇄context ✂compact  (f=filter ?=help) ");
+      const legendPlain = stripAnsi(legend);
+      lines.push(`│${(legendPlain.length > avail ? truncate(stripAnsi(legend), avail-1) : legend).padEnd(avail)}│`);
       lines.push(c.dim("├" + "─".repeat(Math.max(0, width-2)) + "┤"));
 
       if (v.length === 0) {
@@ -339,15 +362,12 @@ function makeTimelineComponent(done: (v: unknown) => void, theme: any, tui: any)
         return lines;
       }
 
-      // scroll window: keep selected visible
-      const viewportRows = 18; // approximate visible rows for timeline body
+      // adaptive viewport based on width-provided; approximate but better than hardcoded 18
+      const viewportRows = Math.max(8, Math.min(30, Math.floor((width > 80 ? 22 : 16))));
       if (selected < scroll) scroll = selected;
       if (selected >= scroll + viewportRows) scroll = selected - viewportRows + 1;
       const start = Math.max(0, Math.min(scroll, v.length - viewportRows));
       const end = Math.min(v.length, start + viewportRows);
-
-      // column widths
-      const timeW = 10;
 
       for (let i = start; i < end; i++) {
         const ev = v[i]!;
@@ -358,19 +378,17 @@ function makeTimelineComponent(done: (v: unknown) => void, theme: any, tui: any)
         const time = c.dim(fmtTime(ev.ts));
         const tok = ev.tokensEst ? c.dim(` ~${fmtK(ev.tokensEst)}t`) : "";
         const meta = ev.meta ? c.dim(` · ${truncate(ev.meta, 24)}`) : "";
-        // main row
         const left = `${prefix} ${icon} ${time} `;
-        const label = isSel ? theme.fg("accent", ev.label) : ev.label;
+        const label = isSel ? (()=>{ try{return theme.fg("accent", ev.label);}catch{return ev.label;}})() : ev.label;
         const right = `${tok}${meta}`;
-        const rowAvail = Math.max(0, avail - left.replace(/\x1b\[[0-9;]*m/g,"").length - right.replace(/\x1b\[[0-9;]*m/g,"").length - 2);
+        const leftPlain = stripAnsi(left);
+        const rightPlain = stripAnsi(right);
+        const rowAvail = Math.max(0, avail - leftPlain.length - rightPlain.length - 2);
         let row = `│${left}${truncate(label, rowAvail)}${" ".repeat(Math.max(1, rowAvail - truncate(label, rowAvail).length))}${right} │`;
-        // selected row background hint
-        if (isSel) { try { row = theme.bg("selectedBg", row); } catch { try { row = theme.inverse(row); } catch {} } }
+        if (isSel) { try { row = (theme as any).bg ? (theme as any).bg("selectedBg", row) : (theme as any).inverse(row); } catch { try { row = theme.inverse(row); } catch {} } }
         lines.push(row);
-        // detail line when expanded or for compact single-line detail
         if (isExp) {
           const det = ev.detail || "(no detail)";
-          // wrap detail into width
           const detLines = wrap(det, avail - 6);
           for (const dl of detLines.slice(0, 6)) {
             lines.push(`│   ${c.dim("│")} ${c.dim(truncate(dl, avail - 6)).padEnd(avail-6)} │`);
@@ -384,7 +402,6 @@ function makeTimelineComponent(done: (v: unknown) => void, theme: any, tui: any)
         }
       }
 
-      // overflow indicator
       if (v.length > viewportRows) {
         const pos = ` ${end}/${v.length} `;
         const moreTop = start > 0 ? c.dim(`↑ ${start} above`) : "";
@@ -397,12 +414,12 @@ function makeTimelineComponent(done: (v: unknown) => void, theme: any, tui: any)
 
       if (showHelp) {
         lines.push(c.accent("  Help — how Pi context works:"));
-        lines.push(c.dim("   1) System prompt: model instructions + guidelines + tool defs + skills"));
-        lines.push(c.dim("   2) Conversation: user ↔ assistant messages (history)"));
-        lines.push(c.dim("   3) Tools: model calls tools → results are appended to context"));
-        lines.push(c.dim("   4) Context transform: extensions may edit context before the model sees it"));
-        lines.push(c.dim("   5) Compaction/summary: old turns summarized when window fills"));
-        lines.push(c.dim("   6) Token window: model has a max (e.g. 128k–200k); bar shows ~usage"));
+        lines.push(c.dim("   1) System prompt: instructions + tools + skills"));
+        lines.push(c.dim("   2) Conversation: user ↔ assistant messages"));
+        lines.push(c.dim("   3) Tools: results appended to next context"));
+        lines.push(c.dim("   4) Context transform: extensions may edit messages"));
+        lines.push(c.dim("   5) Compaction: old turns summarized when ~window fills"));
+        lines.push(c.dim("   6) Token bar is ~est (128k est); real limit varies by model"));
         lines.push("");
       }
       lines.push(c.dim("  ↑/↓ or j/k move  ·  Enter expand  ·  g/G top/bottom  ·  f filter  ·  c clear  ·  e export  ·  q close  ·  ? help"));
@@ -414,14 +431,15 @@ function makeTimelineComponent(done: (v: unknown) => void, theme: any, tui: any)
 }
 
 function wrap(s: string, w: number): string[] {
+  if (w <= 0) return [""];
   const out: string[] = [];
   const words = s.split(/(\s+)/);
   let cur = "";
   for (const wd of words) {
+    if (!wd) continue;
     if ((cur + wd).length > w) {
       if (cur) out.push(cur);
       if (wd.length > w) {
-        // hard break long token
         for (let i = 0; i < wd.length; i += w) out.push(wd.slice(i, i + w));
         cur = "";
       } else cur = wd.trimStart();
@@ -436,27 +454,30 @@ function wrap(s: string, w: number): string[] {
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_ev: SessionStartEvent, ctx) => {
     currentCtx = ctx as unknown as ExtensionContext;
+    const sid: string | undefined = (ctx as any).sessionId ?? (_ev as any).sessionId;
+    const isNewSession = sid !== lastSessionId;
+    if (sid) lastSessionId = sid;
     if (timeline.length === 0) {
-      push({ kind: "session", label: "Session started", detail: `Session ${(_ev as any).sessionId?.slice(0, 8) ?? ""} · cwd: ${process.cwd()}`, meta: (ctx as any).mode ?? "" });
-      push({ kind: "info", label: "How context works", detail: "System prompt (instructions+tools+skills) + conversation history + tool results = context sent to model. When the window fills, Pi compacts old turns into a summary. Use /ctx to open the timeline." });
-    } else {
-      push({ kind: "session", label: "Session resumed", detail: `Resumed with ${timeline.length} prior events` });
+      push({ kind: "session", label: "Session started", detail: `Session ${String(sid ?? "").slice(0, 8)} · cwd: ${String(process.cwd()).split(/[\\/]/).pop() ?? process.cwd()}`, meta: (ctx as any).mode ?? "" });
+      push({ kind: "info", label: "How context works", detail: "System prompt (instructions+tools+skills) + conversation + tool results = context. When ~window fills, Pi compacts old turns. Use /ctx to view." });
+    } else if (isNewSession) {
+      push({ kind: "session", label: "Session resumed", detail: `Resumed · ${timeline.length} prior events (session ${String(sid ?? "").slice(0,8)})` });
     }
-    if (ctx.model) lastModel = `${ctx.model.provider}/${ctx.model.id}`;
+    if ((ctx as any).model) lastModel = `${(ctx as any).model.provider}/${(ctx as any).model.id}`;
     updateWidget();
   });
 
   pi.on("session_shutdown", async () => {
     currentCtx = null;
     if (widgetTimer) { clearTimeout(widgetTimer); widgetTimer = null; }
+    try { (currentCtx as any)?.ui?.setStatus?.("context-timeline", ""); } catch {}
   });
 
-  pi.on("model_select", async (ev: any, ctx) => {
+  pi.on("model_select", async (ev: any, _ctx) => {
     lastModel = `${ev.model.provider}/${ev.model.id}`;
     const prev = ev.previousModel ? `${ev.previousModel.provider}/${ev.previousModel.id}` : "none";
     push({ kind: "model", label: `Model → ${lastModel}`, detail: `${prev} → ${lastModel} · source: ${ev.source ?? "unknown"}`, meta: ev.source });
     updateWidget();
-    ctx.ui.notify?.(`Context-Timeline: model ${lastModel}`, "info");
   });
 
   pi.on("before_agent_start", async (ev: BeforeAgentStartEvent, _ctx) => {
@@ -468,12 +489,11 @@ export default function (pi: ExtensionAPI) {
     const tokEst = estTokens(sysText || sysSummary) + estTokens(JSON.stringify(msgs).slice(0, 8000));
     push({
       kind: "system",
-      label: `System prompt built · ${msgCount} msgs`,
+      label: `System prompt · ${msgCount} msgs`,
       detail: sysSummary + (sysText ? `\n— preview —\n${sysText.slice(0, 600)}${sysText.length > 600 ? "…" : ""}` : "") + (msgs.length ? `\nMessages: ${msgs.slice(0,3).map((m:any)=>m.role).join(", ")}${msgs.length>3 ? ` +${msgs.length-3} more` : ""}` : ""),
       tokensEst: tokEst,
       meta: lastModel ?? undefined,
     });
-    // also capture last user message if present
     const lastUser = [...msgs].reverse().find((m: any) => m.role === "user");
     if (lastUser) {
       const raw = (lastUser as any).content;
@@ -486,13 +506,10 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("context", async (ev: ContextEvent) => {
     const before = (ev as any).messages?.length ?? (ev as any).context?.length ?? 0;
-    // handlers can return { messages } to transform
-    // we just log that a transform occurred; detail is limited
-    push({ kind: "context", label: `Context transform · ${before} msgs`, detail: `A context handler ran. This is where extensions can trim, reorder, or inject messages before the model sees them. If no handler returned a value, context is unchanged.`, meta: `in: ${before}` });
+    push({ kind: "context", label: `Context transform · ${before} msgs`, detail: `A context handler ran. This is where extensions can trim/reorder/inject messages before the model sees them. If no handler returned a value, context is unchanged.`, meta: `in: ${before}` });
   });
 
   pi.on("message_start", async (_ev: any) => {
-    // streaming start — lightweight
     push({ kind: "info", label: "Assistant streaming…", detail: `Model ${lastModel ?? ""} started generating`, meta: "stream" });
   });
 
@@ -502,16 +519,14 @@ export default function (pi: ExtensionAPI) {
     const rawContent: any = (msg as any).content;
     const content = typeof rawContent === "string" ? rawContent : Array.isArray(rawContent) ? rawContent.filter((c:any)=>c.type==="text").map((c:any)=>c.text).join("\n") : "";
     const usage = msg.usage ?? ev.usage;
-    const tokIn = usage?.input ?? estTokens(content);
-    const tokOut = usage?.output ?? 0;
-    if (usage) { totalTokensIn += usage.input ?? 0; totalTokensOut += usage.output ?? 0; }
+    const tokEst = usage ? (usage.input ?? 0) + (usage.output ?? 0) : estTokens(content);
     push({
       kind: role === "user" ? "user" : "assistant",
       label: role === "assistant"
         ? (content.slice(0, 80).replace(/\n/g, " ") || `(assistant · ${msg.stopReason ?? "stop"})`) + (content.length>80?"…":"")
         : content.slice(0,80),
       detail: content ? content.slice(0, 3000) + (content.length>3000 ? "\n… (truncated)" : "") : JSON.stringify(msg).slice(0, 1200),
-      tokensEst: tokIn + tokOut || estTokens(content),
+      tokensEst: tokEst || estTokens(content) || undefined,
       meta: usage ? `${usage.input ?? "?"}↑ ${usage.output ?? "?"}↓${usage.cost ? ` $${usage.cost.total?.toFixed?.(4) ?? ""}` : ""}` : msg.stopReason,
     });
   });
@@ -520,7 +535,7 @@ export default function (pi: ExtensionAPI) {
     const name = (ev as any).toolName ?? (ev as any).name ?? "tool";
     const input = (ev as any).input ?? (ev as any).args ?? {};
     const preview = JSON.stringify(input).slice(0, 300);
-    push({ kind: "tool-call", label: `tool: ${name}`, detail: preview || "(no args)", tokensEst: estTokens(preview), meta: name });
+    push({ kind: "tool-call", label: `tool: ${name}`, detail: preview || "(no args)", tokensEst: estTokens(preview) || undefined, meta: name });
   });
 
   pi.on("tool_result", async (ev: ToolResultEvent) => {
@@ -528,10 +543,9 @@ export default function (pi: ExtensionAPI) {
     const res: any = (ev as any).result ?? ev;
     const text = res?.content?.[0]?.text ?? res?.text ?? JSON.stringify(res).slice(0, 600);
     const isErr = res?.isError || (ev as any).isError;
-    push({ kind: "tool-result", label: `${isErr ? "✗" : "✓"} ${name} result`, detail: String(text).slice(0, 2000), tokensEst: estTokens(String(text)), meta: isErr ? "error" : "ok" });
+    push({ kind: "tool-result", label: `${isErr ? "✗" : "✓"} ${name} result`, detail: String(text).slice(0, 2000), tokensEst: estTokens(String(text)) || undefined, meta: isErr ? "error" : "ok" });
   });
 
-  // also tool_execution_* for streaming tool feedback
   pi.on("tool_execution_start" as any, async (ev: any) => {
     push({ kind: "info", label: `tool exec start: ${ev.toolName ?? ev.name ?? "tool"}`, detail: JSON.stringify(ev.input ?? ev.args ?? {}).slice(0, 400), meta: "exec" });
   });
@@ -547,7 +561,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_end", async (_ev: any) => {
     const u = (_ev as any).usage ?? (_ev as any).result?.usage;
-    if (u) push({ kind: "info", label: `Agent run end`, detail: `usage: ${u.input ?? "?"} in / ${u.output ?? "?"} out`, tokensEst: (u.input ?? 0) + (u.output ?? 0), meta: "agent_end" });
+    if (u) push({ kind: "info", label: `Agent run end`, detail: `usage: ${u.input ?? "?"} in / ${u.output ?? "?"} out`, tokensEst: (u.input ?? 0) + (u.output ?? 0) || undefined, meta: "agent_end" });
     else push({ kind: "info", label: "Agent run end", detail: "Run finished; may continue with compaction or follow-ups", meta: "agent_end" });
     updateWidget();
   });
@@ -564,19 +578,15 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_compact" as any, async (ev: SessionCompactEvent) => {
     const e: any = ev;
     push({ kind: "compaction", label: `Compacted → summary ${String(e.compactionId ?? "").slice(0,8)}`, detail: (e.summary ?? e.compaction?.summary ?? "").slice(0, 1200) || "Summary created; old turns replaced", tokensEst: e.tokensBefore ?? e.compaction?.tokensBefore, meta: "compact" });
-    compactionCount++;
     updateWidget();
   });
   pi.on("session_compact_failed" as any, async (ev: any) => {
     push({ kind: "info", label: "Compaction failed", detail: String(ev.error ?? ev.reason ?? "unknown").slice(0, 800), meta: "error" });
   });
 
-  // ── Commands ───────────────────────────────────────────────────────────────
-
   async function openTimeline(ctx: ExtensionContext) {
     if ((ctx as any).mode !== "tui") {
       ctx.ui.notify("Context timeline requires interactive TUI mode", "error");
-      // fallback: dump to console
       console.log("\n=== Pi Context Timeline ===");
       for (const e of timeline.slice(-40)) {
         console.log(`[${fmtTime(e.ts)}] ${e.kind} — ${e.label} ${e.tokensEst ? `(${e.tokensEst}t)` : ""}`);
@@ -613,14 +623,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("ctx-export", {
-    description: "Export timeline to JSON file",
+    description: "Export timeline to JSON file (safe basename, .json only)",
     handler: async (args, ctx) => {
       const fs = await import("node:fs");
       const path = await import("node:path");
-      const name = args.trim() || `context-timeline-${Date.now()}.json`;
-      const p = path.isAbsolute(name) ? name : path.join(process.cwd(), name);
+      const safeName = sanitizeExportName(args.trim() || `context-timeline-${Date.now()}.json`, `context-timeline-${Date.now()}.json`);
+      const p = path.join(process.cwd(), safeName);
       const payload = { exportedAt: new Date().toISOString(), model: lastModel, totals: { in: totalTokensIn, out: totalTokensOut, compactions: compactionCount }, timeline };
-      fs.writeFileSync(p, JSON.stringify(payload, null, 2), "utf8");
+      await fs.promises.writeFile(p, JSON.stringify(payload, null, 2), "utf8");
       ctx.ui.notify(`Exported ${timeline.length} events → ${p}`, "info");
     },
   });
@@ -631,27 +641,25 @@ export default function (pi: ExtensionAPI) {
       const msg = [
         "## How Pi Context Works",
         "",
-        "Every model request sends a **context** = system prompt + conversation history + tool results.",
+        "Every model request sends a context = system prompt + conversation + tool results.",
         "",
-        "1. **System prompt** — built from `before_agent_start` (`systemPromptOptions`): core instructions, guidelines, available tools, skills, project context.",
-        "2. **Messages** — alternating user / assistant turns. Assistant messages may contain tool calls.",
-        "3. **Tool results** — after tools run, their outputs are appended as `tool_result` messages and become part of next context.",
-        "4. **Context transforms** — extensions can edit context via the `context` event before it reaches the model.",
-        "5. **Token window** — each model has a max (e.g. 128k–200k tokens). The status bar shows ~usage.",
-        "6. **Compaction** — when context grows too large, Pi summarizes old turns (`session_before_compact` → `session_compact`) and keeps the summary + recent turns.",
+        "1. System prompt — built from before_agent_start (instructions, tools, skills, project context).",
+        "2. Messages — alternating user / assistant turns.",
+        "3. Tool results — outputs appended as context for next turn.",
+        "4. Context transforms — extensions may edit messages before model sees them.",
+        "5. Token window — model max varies (e.g. 128k~200k); bar shows ~est.",
+        "6. Compaction — Pi summarizes old turns when ~window fills.",
         "",
-        "Open the live view with **/ctx** — it shows each step as a timeline so you can see what the model actually sees.",
+        "Open live view with /ctx",
       ].join("\n");
-      // show as notification + log; also push to timeline
       push({ kind: "info", label: "Context help viewed", detail: msg.slice(0, 1200) });
       if ((ctx as any).mode === "tui" && (ctx.ui as any).notify) {
-        // also render via custom overlay for readability
         await ctx.ui.custom((tui: any, theme: any, _kb: any, done: any) => {
           return {
             handleInput(d: string) { if (d === "\x1b" || d === "q" || d === "\r" ) done(null); },
             render(w: number) {
-              const lines = msg.split("\n").map(l => theme.fg("dim", l.slice(0, w-2)));
-              return [theme.fg("accent", "┌─ How Pi Context Works ─┐"), ...lines.map(l=> "│ "+l), theme.fg("dim","└" + "─".repeat(Math.max(0,w-2))+"┘"), theme.fg("dim","  q/Esc to close")];
+              const lines = msg.split("\n").map(l => { try{return theme.fg("dim", l.slice(0, w-2));}catch{return l;}});
+              return [(()=>{try{return theme.fg("accent","┌─ How Pi Context Works ─┐");}catch{return "How Pi Context Works";}})(), ...lines.map(l=> "│ "+l), (()=>{try{return theme.fg("dim","└" + "─".repeat(Math.max(0,w-2))+"┘");}catch{return "";}})(), "  q/Esc to close"];
             },
             invalidate(){}
           };
