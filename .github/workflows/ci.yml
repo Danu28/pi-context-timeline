@@ -12,6 +12,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - run: npm install
       - run: npx tsc --noEmit
       - run: npm pack --dry-run
-      - run: node --check extensions/context-timeline.ts
