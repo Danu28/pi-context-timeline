@@ -1,6 +1,6 @@
 {
   "name": "pi-context-timeline",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Interactive context timeline for Pi coding agent — visualize how prompts, messages, tools, and compaction build the model context",
   "type": "module",
   "keywords": [

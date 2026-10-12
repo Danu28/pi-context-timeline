@@ -85,15 +85,22 @@ function push(ev: Omit<TimelineEvent, "id" | "ts"> & { ts?: number }) {
   };
   timeline.push(e);
   if (timeline.length > MAX_EVENTS) {
-    const dropped = timeline.length - MAX_EVENTS;
+    const dropped = timeline.slice(0, timeline.length - MAX_EVENTS);
     timeline = timeline.slice(-MAX_EVENTS);
-    // keep totals bounded roughly - we keep est, but note truncation
-    if (dropped > 0 && e.kind !== "info") {
-      // totals stay; bar is ~ anyway
+    // keep window totals bounded: subtract dropped tokens
+    for (const d of dropped) {
+      if (!d.tokensEst) continue;
+      if (d.kind === "user" || d.kind === "system" || d.kind === "context" || d.kind === "tool-call" || d.kind === "tool-result") {
+        totalTokensIn = Math.max(0, totalTokensIn - d.tokensEst);
+      } else if (d.kind === "assistant") {
+        totalTokensOut = Math.max(0, totalTokensOut - d.tokensEst);
+      } else if (d.kind === "compaction") {
+        // compaction tokens not added to In/Out in push, nothing to subtract
+      }
     }
   }
   if (e.tokensEst) {
-    if (e.kind === "user" || e.kind === "system" || e.kind === "context") totalTokensIn += e.tokensEst;
+    if (e.kind === "user" || e.kind === "system" || e.kind === "context" || e.kind === "tool-call" || e.kind === "tool-result") totalTokensIn += e.tokensEst;
     if (e.kind === "assistant") totalTokensOut += e.tokensEst;
   }
   if (e.kind === "compaction") compactionCount++;
@@ -356,8 +363,9 @@ function makeTimelineComponent(done: (v: unknown) => void, theme: any, tui: any)
         return lines;
       }
 
-      // adaptive viewport based on width-provided; approximate but better than hardcoded 18
-      const viewportRows = Math.max(8, Math.min(30, Math.floor((width > 80 ? 22 : 16))));
+      // adaptive viewport: prefer tui height when available, else width fallback
+      const termH = (tui as any)?.height ?? (tui as any)?.rows ?? 24;
+      const viewportRows = Math.max(8, Math.min(30, Math.floor(termH > 30 ? 22 : termH > 20 ? 18 : 14)));
       if (selected < scroll) scroll = selected;
       if (selected >= scroll + viewportRows) scroll = selected - viewportRows + 1;
       const start = Math.max(0, Math.min(scroll, v.length - viewportRows));
@@ -475,26 +483,31 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (ev: BeforeAgentStartEvent, _ctx) => {
-    const opts: any = (ev as any).systemPromptOptions ?? (ev as any).options ?? (ev as any).promptOptions;
-    const msgs: any[] = (ev as any).messages ?? (ev as any).prompt?.messages ?? [];
-    const sysSummary = summarizeSystemPrompt(opts);
-    const msgCount = msgs.length;
-    const sysText = typeof (ev as any).systemPrompt === "string" ? (ev as any).systemPrompt : "";
-    const tokEst = estTokens(sysText || sysSummary) + estTokens(JSON.stringify(msgs).slice(0, 8000));
-    push({
-      kind: "system",
-      label: `System prompt · ${msgCount} msgs`,
-      detail: sysSummary + (sysText ? `\n— preview —\n${sysText.slice(0, 600)}${sysText.length > 600 ? "…" : ""}` : "") + (msgs.length ? `\nMessages: ${msgs.slice(0,3).map((m:any)=>m.role).join(", ")}${msgs.length>3 ? ` +${msgs.length-3} more` : ""}` : ""),
-      tokensEst: tokEst,
-      meta: lastModel ?? undefined,
-    });
-    const lastUser = [...msgs].reverse().find((m: any) => m.role === "user");
-    if (lastUser) {
-      const raw = (lastUser as any).content;
-      const text = (typeof raw === "string" ? raw : Array.isArray(raw) ? raw.filter((c:any)=>c.type==="text").map((c:any)=>c.text).join("\n") : "").slice(0, 800) || JSON.stringify(lastUser).slice(0, 500);
-      if (text) {
-        push({ kind: "user", label: text.slice(0, 80).replace(/\n/g, " ") + (text.length>80?"…":""), detail: text, tokensEst: estTokens(text) });
+    try {
+      const evAny: any = ev as any;
+      const opts: any = evAny.systemPromptOptions ?? evAny.options ?? evAny.promptOptions ?? evAny.systemPromptOptionsNormalized;
+      const msgs: any[] = evAny.messages ?? evAny.prompt?.messages ?? [];
+      const sysSummary = summarizeSystemPrompt(opts);
+      const msgCount = msgs.length;
+      const sysText = typeof evAny.systemPrompt === "string" ? evAny.systemPrompt : "";
+      const tokEst = estTokens(sysText || sysSummary) + estTokens(JSON.stringify(msgs).slice(0, 8000));
+      push({
+        kind: "system",
+        label: `System prompt · ${msgCount} msgs`,
+        detail: sysSummary + (sysText ? `\n— preview —\n${sysText.slice(0, 600)}${sysText.length > 600 ? "…" : ""}` : "") + (msgs.length ? `\nMessages: ${msgs.slice(0,3).map((m:any)=>m.role).join(", ")}${msgs.length>3 ? ` +${msgs.length-3} more` : ""}` : ""),
+        tokensEst: tokEst,
+        meta: lastModel ?? undefined,
+      });
+      const lastUser = [...msgs].reverse().find((m: any) => m.role === "user");
+      if (lastUser) {
+        const raw = (lastUser as any).content;
+        const text = (typeof raw === "string" ? raw : Array.isArray(raw) ? raw.filter((c:any)=>c.type==="text").map((c:any)=>c.text).join("\n") : "").slice(0, 800) || JSON.stringify(lastUser).slice(0, 500);
+        if (text) {
+          push({ kind: "user", label: text.slice(0, 80).replace(/\n/g, " ") + (text.length>80?"…":""), detail: text, tokensEst: estTokens(text) });
+        }
       }
+    } catch (e: any) {
+      push({ kind: "info", label: "before_agent_start error", detail: String(e?.message ?? e).slice(0, 600), meta: "error" });
     }
   });
 
@@ -508,21 +521,25 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("message_end", async (ev: any) => {
-    const msg = ev.message ?? ev;
-    const role = msg.role ?? "assistant";
-    const rawContent: any = (msg as any).content;
-    const content = typeof rawContent === "string" ? rawContent : Array.isArray(rawContent) ? rawContent.filter((c:any)=>c.type==="text").map((c:any)=>c.text).join("\n") : "";
-    const usage = msg.usage ?? ev.usage;
-    const tokEst = usage ? (usage.input ?? 0) + (usage.output ?? 0) : estTokens(content);
-    push({
-      kind: role === "user" ? "user" : "assistant",
-      label: role === "assistant"
-        ? (content.slice(0, 80).replace(/\n/g, " ") || `(assistant · ${msg.stopReason ?? "stop"})`) + (content.length>80?"…":"")
-        : content.slice(0,80),
-      detail: content ? content.slice(0, 3000) + (content.length>3000 ? "\n… (truncated)" : "") : JSON.stringify(msg).slice(0, 1200),
-      tokensEst: tokEst || estTokens(content) || undefined,
-      meta: usage ? `${usage.input ?? "?"}↑ ${usage.output ?? "?"}↓${usage.cost ? ` $${usage.cost.total?.toFixed?.(4) ?? ""}` : ""}` : msg.stopReason,
-    });
+    try {
+      const msg = ev.message ?? ev;
+      const role = msg.role ?? "assistant";
+      const rawContent: any = (msg as any).content;
+      const content = typeof rawContent === "string" ? rawContent : Array.isArray(rawContent) ? rawContent.filter((c:any)=>c.type==="text").map((c:any)=>c.text).join("\n") : "";
+      const usage = msg.usage ?? ev.usage;
+      const tokEst = usage ? (usage.input ?? 0) + (usage.output ?? 0) : estTokens(content);
+      push({
+        kind: role === "user" ? "user" : "assistant",
+        label: role === "assistant"
+          ? (content.slice(0, 80).replace(/\n/g, " ") || `(assistant · ${msg.stopReason ?? "stop"})`) + (content.length>80?"…":"")
+          : content.slice(0,80),
+        detail: content ? content.slice(0, 3000) + (content.length>3000 ? "\n… (truncated)" : "") : JSON.stringify(msg).slice(0, 1200),
+        tokensEst: tokEst || estTokens(content) || undefined,
+        meta: usage ? `${usage.input ?? "?"}↑ ${usage.output ?? "?"}↓${usage.cost ? ` ${usage.cost.total?.toFixed?.(4) ?? ""}` : ""}` : msg.stopReason,
+      });
+    } catch (e: any) {
+      push({ kind: "info", label: "message_end error", detail: String(e?.message ?? e).slice(0, 400), meta: "error" });
+    }
   });
 
   pi.on("tool_call", async (ev: ToolCallEvent) => {
@@ -580,12 +597,7 @@ export default function (pi: ExtensionAPI) {
 
   async function openTimeline(ctx: ExtensionContext) {
     if ((ctx as any).mode !== "tui") {
-      ctx.ui.notify("Context timeline requires interactive TUI mode", "error");
-      console.log("\n=== Pi Context Timeline ===");
-      for (const e of timeline.slice(-40)) {
-        console.log(`[${fmtTime(e.ts)}] ${e.kind} — ${e.label} ${e.tokensEst ? `(${e.tokensEst}t)` : ""}`);
-        if (e.detail) console.log(`  ${e.detail.slice(0, 200)}`);
-      }
+      ctx.ui.notify("Context timeline requires interactive TUI mode — timeline has " + timeline.length + " events (see /ctx-export)", "error");
       return;
     }
     await ctx.ui.custom((tui: any, theme: any, _kb: any, done: any) => {
@@ -659,7 +671,7 @@ export default function (pi: ExtensionAPI) {
           };
         }, { overlay: true, overlayOptions: { width: "86%", maxHeight: "80%", anchor: "center" } } as any);
       } else {
-        console.log(msg);
+        ctx.ui.notify(msg.slice(0, 800), "info");
       }
     },
   });

@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.3] - 2026-10-12
+### Fixed
+- Token accounting: tool-call/tool-result now counted in window, truncation subtracts dropped tokens
+- before_agent_start / message_end wrapped in try/catch (type-safety)
+- Remove console.log fallbacks (use ui.notify, no stdout pollution)
+- Viewport adaptive to terminal height (was width-based)
+
+### Changed
+- CI adds pack check
+
+
 All notable changes to pi-context-timeline.
 
 ## [1.0.2] - 2026-10-12
